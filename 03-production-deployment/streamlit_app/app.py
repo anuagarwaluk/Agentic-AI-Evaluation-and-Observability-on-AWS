@@ -1,0 +1,317 @@
+"""
+Product Catalog Agent - Streamlit Chat Application
+
+Chat interface for the single Product Catalog Agent deployed to AgentCore Runtime.
+Supports user login (customer/admin) and demonstrates RBAC in production.
+"""
+
+import streamlit as st
+import json
+import os
+import re
+import uuid
+from datetime import datetime
+import boto3
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+def load_config():
+    """Load deployment configuration from agent_config.json."""
+    config_path = os.path.join(os.path.dirname(__file__), "agent_config.json")
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    return None
+
+
+def sanitize_error(exc):
+    """Return token-safe error text for the local demo UI."""
+    text = str(exc)
+    text = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text, flags=re.I)
+    text = re.sub(r"\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", "<jwt>", text)
+    text = re.sub(r"(?i)(password|token|secret|authorization)=?[^\\s,;]+", r"\1=<redacted>", text)
+    return f"{type(exc).__name__}: {text[:180]}"
+
+
+def demo_credentials(config):
+    """Derive synthetic workshop users without storing credentials in config."""
+    suffix = config.get('demo_user_suffix')
+    if not suffix:
+        deployment_id = str(config.get('deployment_id', ''))
+        suffix = deployment_id.split('-')[-1] if '-' in deployment_id else None
+    if not suffix:
+        return None
+
+    password = os.environ.get('SECTION03_TEST_PASSWORD', f"{suffix}Aa1!z9")
+    return {
+        "Customer": {
+            "email": os.environ.get(
+                'SECTION03_CUSTOMER_EMAIL',
+                f"customer+{suffix}@example.com",
+            ),
+            "password": password,
+            "role": "customer",
+        },
+        "Admin": {
+            "email": os.environ.get(
+                'SECTION03_ADMIN_EMAIL',
+                f"admin+{suffix}@example.com",
+            ),
+            "password": password,
+            "role": "admin",
+        },
+    }
+
+
+def get_user_token(cognito_client, user_pool_id, client_id, email, password):
+    """Authenticate user and get JWT tokens."""
+    try:
+        response = cognito_client.admin_initiate_auth(
+            UserPoolId=user_pool_id,
+            ClientId=client_id,
+            AuthFlow='ADMIN_USER_PASSWORD_AUTH',
+            AuthParameters={'USERNAME': email, 'PASSWORD': password}
+        )
+        tokens = response.get('AuthenticationResult', {})
+        return {
+            'id_token': tokens.get('IdToken', ''),
+            'access_token': tokens.get('AccessToken', ''),
+        }
+    except Exception as e:
+        st.error(f"Login failed: {sanitize_error(e)}")
+        return None
+
+
+# ============================================================================
+# AGENT INVOCATION
+# ============================================================================
+
+def invoke_agent(config, prompt, bearer_token, access_token, session_id):
+    """Invoke the Product Catalog Agent via AgentCore Runtime."""
+    try:
+        region = config.get('region', 'us-west-2')
+        runtime_arn = config['runtime_arn']
+
+        client = boto3.client('bedrock-agentcore', region_name=region)
+
+        payload = {
+            'prompt': prompt,
+            'bearer_token': bearer_token,
+            'access_token': access_token,
+            'session_id': session_id
+        }
+
+        response = client.invoke_agent_runtime(
+            agentRuntimeArn=runtime_arn,
+            runtimeSessionId=session_id,
+            payload=json.dumps(payload).encode('utf-8')
+        )
+
+        # Read streaming or JSON response
+        content = []
+        resp = response.get('response', [])
+        if hasattr(resp, 'iter_lines'):
+            for line in resp.iter_lines(chunk_size=10):
+                if line:
+                    line = line.decode('utf-8') if isinstance(line, bytes) else line
+                    if line.startswith('data: '):
+                        line = line[6:]
+                    content.append(line)
+        elif hasattr(resp, '__iter__'):
+            for chunk in resp:
+                if isinstance(chunk, bytes):
+                    content.append(chunk.decode('utf-8'))
+                else:
+                    content.append(str(chunk))
+
+        full_response = '\n'.join(content)
+        return json.loads(full_response)
+    except Exception as e:
+        return {'status': 'error', 'error': sanitize_error(e)}
+
+
+# ============================================================================
+# STREAMLIT UI
+# ============================================================================
+
+st.set_page_config(
+    page_title="Product Catalog Agent",
+    page_icon="🛍",
+    layout="wide"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+.role-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 0.85em;
+    font-weight: bold;
+}
+.role-customer { background-color: #d4edda; color: #155724; }
+.role-admin { background-color: #fff3cd; color: #856404; }
+.tools-info { background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin: 5px 0; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("Product Catalog Agent")
+
+# Load config
+config = load_config()
+if not config:
+    st.error("Configuration not found. Run the deployment notebook first (03-production-deployment.ipynb).")
+    st.stop()
+
+# Session state
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+if 'user_role' not in st.session_state:
+    st.session_state.user_role = None
+if 'bearer_token' not in st.session_state:
+    st.session_state.bearer_token = ''
+if 'access_token' not in st.session_state:
+    st.session_state.access_token = ''
+
+# Sidebar - Login
+with st.sidebar:
+    st.header("User Login")
+
+    if not st.session_state.logged_in:
+        st.write("Login to test different roles (RBAC)")
+
+        # Synthetic workshop users created by the deployment notebook.
+        user_options = demo_credentials(config)
+        if not user_options:
+            st.error("Demo user metadata is missing. Re-run the deployment notebook.")
+            st.stop()
+
+        selected_user = st.selectbox("Select test user:", list(user_options.keys()))
+
+        if st.button("Login", type="primary"):
+            user = user_options[selected_user]
+            region = config.get('region', 'us-west-2')
+            cognito = boto3.client('cognito-idp', region_name=region)
+
+            tokens = get_user_token(
+                cognito,
+                config['user_pool_id'],
+                config['user_client_id'],
+                user['email'],
+                user['password']
+            )
+
+            if tokens:
+                st.session_state.logged_in = True
+                st.session_state.user_role = user['role']
+                st.session_state.bearer_token = tokens['id_token']
+                st.session_state.access_token = tokens['access_token']
+                st.session_state.messages = []
+                st.rerun()
+    else:
+        role = st.session_state.user_role
+        badge_class = f"role-{role}"
+        st.markdown(
+            f'<span class="role-badge {badge_class}">{role.upper()}</span>',
+            unsafe_allow_html=True
+        )
+
+        if role == 'customer':
+            st.info("Tools: search, details, inventory, compare, recommendations, return policy")
+        else:
+            st.success("Tools: ALL 11 tools (6 read + 5 admin)")
+
+        if st.button("Logout"):
+            st.session_state.logged_in = False
+            st.session_state.user_role = None
+            st.session_state.bearer_token = ''
+            st.session_state.access_token = ''
+            st.session_state.messages = []
+            st.rerun()
+
+        st.divider()
+        st.subheader("Example Queries")
+        if role == 'customer':
+            examples = [
+                "Search for wireless headphones under $100",
+                "Compare PROD-001 and PROD-055",
+                "Is PROD-088 in stock?",
+                "What's the return policy?"
+            ]
+        else:
+            examples = [
+                "Create product PROD-200 'Gaming Headset' in Audio for $129.99",
+                "Set PROD-088 inventory to 100 units",
+                "Put PROD-001 on sale for $59.99 until 2025-06-30",
+                "Discontinue product PROD-200"
+            ]
+        for ex in examples:
+            if st.button(ex, key=f"ex_{ex[:20]}"):
+                st.session_state.pending_query = ex
+
+# Main chat area
+if not st.session_state.logged_in:
+    st.info("Please login from the sidebar to start chatting with the Product Catalog Agent.")
+    st.stop()
+
+# Display chat history
+for msg in st.session_state.messages:
+    with st.chat_message(msg['role']):
+        st.markdown(msg['content'])
+        if 'metadata' in msg:
+            meta = msg['metadata']
+            with st.expander("Response metadata"):
+                st.json(meta)
+
+# Always render chat_input so the input box is visible
+chat_prompt = st.chat_input("Ask about products...")
+
+# Handle pending query from sidebar example buttons
+if 'pending_query' in st.session_state:
+    prompt = st.session_state.pop('pending_query')
+else:
+    prompt = chat_prompt
+
+if prompt:
+    st.session_state.messages.append({'role': 'user', 'content': prompt})
+    with st.chat_message('user'):
+        st.markdown(prompt)
+
+    with st.chat_message('assistant'):
+        with st.spinner("Thinking..."):
+            result = invoke_agent(
+                config, prompt,
+                st.session_state.bearer_token,
+                st.session_state.access_token,
+                st.session_state.session_id
+            )
+
+        if result.get('status') == 'success':
+            response_text = result.get('response', 'No response')
+            st.markdown(response_text)
+
+            metadata = result.get('metadata', {})
+            if metadata:
+                with st.expander("Response metadata"):
+                    st.json(metadata)
+
+            st.session_state.messages.append({
+                'role': 'assistant',
+                'content': response_text,
+                'metadata': metadata
+            })
+        else:
+            error = result.get('error', 'Unknown error')
+            st.error(f"Error: {error}")
+            st.session_state.messages.append({
+                'role': 'assistant',
+                'content': f"Error: {error}"
+            })
